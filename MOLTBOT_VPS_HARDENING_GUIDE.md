@@ -1,33 +1,77 @@
-# Moltbot VPS Setup & Hardening Guide
+# Moltbot VPS Setup & Hardening Guide (Docker Edition)
 
-A comprehensive step-by-step guide for deploying Moltbot on an Ubuntu VPS with security hardening.
+A comprehensive step-by-step guide for deploying Moltbot in Docker on an Ubuntu VPS with persistent storage and security hardening.
 
 **Target Environment:**
-- Ubuntu 22.04/24.04 LTS VPS
+- Ubuntu 22.04/24.04 LTS VPS (Hetzner or similar)
+- **Gateway-in-Docker deployment** (all components containerized)
 - Remote access via Tailscale only
 - Messaging via Telegram
 - No inbound internet connectivity
+- **Maximum persistence** across container rebuilds
 
-**Estimated Time:** 2-3 hours
+**Estimated Time:** 1.5-2 hours
 
 ---
 
 ## Table of Contents
 
 1. [Phase 1: Initial VPS Hardening](#phase-1-initial-vps-hardening)
-2. [Phase 2: Install Core Dependencies](#phase-2-install-core-dependencies)
-3. [Phase 3: Create Dedicated Moltbot User](#phase-3-create-dedicated-moltbot-user)
+2. [Phase 2: Install Docker & Core Dependencies](#phase-2-install-docker--core-dependencies)
+3. [Phase 3: Configure Persistent Storage](#phase-3-configure-persistent-storage)
 4. [Phase 4: Install and Configure Tailscale](#phase-4-install-and-configure-tailscale)
-5. [Phase 5: Install Moltbot](#phase-5-install-moltbot)
-6. [Phase 6: Configure Moltbot Securely](#phase-6-configure-moltbot-securely)
-7. [Phase 7: Set Up Telegram Integration](#phase-7-set-up-telegram-integration)
-8. [Phase 8: Implement Docker Sandboxing](#phase-8-implement-docker-sandboxing)
-9. [Phase 9: Configure AppArmor Mandatory Access Control](#phase-9-configure-apparmor-mandatory-access-control)
-10. [Phase 10: Set Up Audit Logging](#phase-10-set-up-audit-logging)
-11. [Phase 11: Configure Network Egress Filtering](#phase-11-configure-network-egress-filtering)
-12. [Phase 12: Create Systemd Service with Hardening](#phase-12-create-systemd-service-with-hardening)
-13. [Phase 13: Final Verification & Testing](#phase-13-final-verification--testing)
-14. [Appendix: Maintenance & Monitoring](#appendix-maintenance--monitoring)
+5. [Phase 5: Set Up Telegram Bot](#phase-5-set-up-telegram-bot)
+6. [Phase 6: Configure Moltbot Environment](#phase-6-configure-moltbot-environment)
+7. [Phase 7: Deploy Moltbot Container](#phase-7-deploy-moltbot-container)
+8. [Phase 8: Harden Docker & Network](#phase-8-harden-docker--network)
+9. [Phase 9: Set Up Monitoring & Logging](#phase-9-set-up-monitoring--logging)
+10. [Phase 10: Final Verification & Testing](#phase-10-final-verification--testing)
+11. [Appendix: Maintenance & Persistence](#appendix-maintenance--persistence)
+
+---
+
+## Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        Ubuntu VPS (Hetzner)                      │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │              Docker Container (moltbot-gateway)          │   │
+│  │  ┌─────────────────────────────────────────────────┐    │   │
+│  │  │  Moltbot Gateway + Agent Runtime                 │    │   │
+│  │  │  - Telegram Channel                              │    │   │
+│  │  │  - Tool Execution (sandboxed within container)   │    │   │
+│  │  │  - Memory/Session Management                     │    │   │
+│  │  └─────────────────────────────────────────────────┘    │   │
+│  │                         │                                │   │
+│  │              Volume Mounts (Persistent)                  │   │
+│  └──────────────┬──────────┴─────────────┬─────────────────┘   │
+│                 │                        │                      │
+│  ┌──────────────▼──────────┐  ┌─────────▼──────────────┐      │
+│  │ /opt/moltbot/config     │  │ /opt/moltbot/workspace │      │
+│  │ (.clawdbot data)        │  │ (clawd workspace)      │      │
+│  │ - agents/sessions       │  │ - projects             │      │
+│  │ - memory/               │  │ - files                │      │
+│  │ - moltbot.json          │  │                        │      │
+│  └─────────────────────────┘  └────────────────────────┘      │
+│                                                                  │
+│  ┌──────────────────────┐  ┌─────────────────────────────┐    │
+│  │ /opt/moltbot/home    │  │ /opt/moltbot/secrets        │    │
+│  │ (full home persist)  │  │ (.env file - root owned)    │    │
+│  └──────────────────────┘  └─────────────────────────────┘    │
+│                                                                  │
+│  Tailscale ◄──────── Only inbound access ──────────►           │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Persistence Strategy:**
+- All state lives on host filesystem in `/opt/moltbot/`
+- Container can be destroyed and recreated without data loss
+- Named Docker volume for Node.js home directory persistence
+- Bind mounts for explicit data directories
 
 ---
 
@@ -46,19 +90,19 @@ ssh root@your-vps-ip
 # Update package lists and upgrade all packages
 apt update && apt upgrade -y
 
-# Install essential security tools
+# Install essential tools
 apt install -y \
     ufw \
     fail2ban \
     unattended-upgrades \
     apt-listchanges \
-    needrestart \
     curl \
     wget \
     git \
     jq \
     htop \
-    tree
+    tree \
+    ncdu
 ```
 
 ### Step 1.3: Configure Automatic Security Updates
@@ -66,24 +110,16 @@ apt install -y \
 ```bash
 # Enable unattended upgrades
 dpkg-reconfigure -plow unattended-upgrades
-```
+# Select: Yes
 
-When prompted, select **Yes** to enable automatic updates.
-
-Now configure the update settings:
-
-```bash
+# Configure update settings
 cat > /etc/apt/apt.conf.d/20auto-upgrades << 'EOF'
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
 APT::Periodic::AutocleanInterval "7";
 APT::Periodic::Download-Upgradeable-Packages "1";
 EOF
-```
 
-Configure what gets updated:
-
-```bash
 cat > /etc/apt/apt.conf.d/50unattended-upgrades << 'EOF'
 Unattended-Upgrade::Allowed-Origins {
     "${distro_id}:${distro_codename}";
@@ -91,204 +127,123 @@ Unattended-Upgrade::Allowed-Origins {
     "${distro_id}ESMApps:${distro_codename}-apps-security";
     "${distro_id}ESM:${distro_codename}-infra-security";
 };
-
-Unattended-Upgrade::Package-Blacklist {
-};
-
-Unattended-Upgrade::DevRelease "false";
 Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
 Unattended-Upgrade::Remove-New-Unused-Dependencies "true";
-Unattended-Upgrade::Remove-Unused-Dependencies "true";
 Unattended-Upgrade::Automatic-Reboot "false";
-Unattended-Upgrade::Automatic-Reboot-WithUsers "false";
 EOF
 ```
 
 ### Step 1.4: Configure Timezone
 
 ```bash
-# Set your timezone (adjust as needed)
 timedatectl set-timezone UTC
-
-# Verify
 timedatectl status
 ```
 
 ### Step 1.5: Configure Firewall (UFW)
 
 ```bash
-# Reset UFW to defaults
+# Reset and configure UFW
 ufw --force reset
-
-# Set default policies - deny ALL inbound, allow outbound
 ufw default deny incoming
 ufw default allow outgoing
 
-# DO NOT allow SSH from internet - we'll use Tailscale
-# ufw allow ssh  # <-- DO NOT RUN THIS
-
-# Enable the firewall
+# DO NOT allow SSH from internet yet
 ufw --force enable
-
-# Verify status
 ufw status verbose
 ```
 
 **Expected output:**
 ```
 Status: active
-Logging: on (low)
 Default: deny (incoming), allow (outgoing), disabled (routed)
 ```
 
-> **WARNING:** At this point, if you disconnect, you may lose SSH access until Tailscale is configured. Keep your VPS provider's console access ready as a backup.
+> **WARNING:** Keep your VPS provider's console access ready as backup.
 
-### Step 1.6: Harden SSH Configuration
-
-Even though we'll use Tailscale, let's harden SSH:
+### Step 1.6: Create Administrative User
 
 ```bash
-# Backup original config
-cp /etc/ssh/sshd_config /etc/ssh/sshd_config.backup
-
-# Create hardened SSH config
-cat > /etc/ssh/sshd_config.d/hardening.conf << 'EOF'
-# Disable root login
-PermitRootLogin no
-
-# Disable password authentication (use keys only)
-PasswordAuthentication no
-PermitEmptyPasswords no
-
-# Use only SSH Protocol 2
-Protocol 2
-
-# Limit authentication attempts
-MaxAuthTries 3
-MaxSessions 2
-
-# Disconnect idle sessions after 5 minutes
-ClientAliveInterval 300
-ClientAliveCountMax 0
-
-# Disable X11 forwarding
-X11Forwarding no
-
-# Disable TCP forwarding (can re-enable if needed)
-AllowTcpForwarding no
-
-# Log more verbosely
-LogLevel VERBOSE
-
-# Restrict to specific users (we'll add moltbot-admin later)
-# AllowUsers moltbot-admin
-EOF
-```
-
-> **NOTE:** Don't restart SSH yet - we need to create an admin user first.
-
-### Step 1.7: Create an Administrative User
-
-```bash
-# Create admin user for your own access
+# Create admin user
 useradd -m -s /bin/bash -G sudo moltbot-admin
-
-# Set a strong password
 passwd moltbot-admin
 
-# Create SSH directory
+# Set up SSH key authentication
 mkdir -p /home/moltbot-admin/.ssh
 chmod 700 /home/moltbot-admin/.ssh
 
-# Add your SSH public key (paste your public key here)
+# Add your SSH public key
 cat > /home/moltbot-admin/.ssh/authorized_keys << 'EOF'
 ssh-ed25519 YOUR_PUBLIC_KEY_HERE your-email@example.com
 EOF
 
-# Set permissions
 chmod 600 /home/moltbot-admin/.ssh/authorized_keys
 chown -R moltbot-admin:moltbot-admin /home/moltbot-admin/.ssh
+```
 
-# Enable the AllowUsers directive
-echo "AllowUsers moltbot-admin" >> /etc/ssh/sshd_config.d/hardening.conf
+### Step 1.7: Harden SSH
 
-# Restart SSH
+```bash
+cp /etc/ssh/sshd_config /etc/ssh/sshd_config.backup
+
+cat > /etc/ssh/sshd_config.d/hardening.conf << 'EOF'
+PermitRootLogin no
+PasswordAuthentication no
+PermitEmptyPasswords no
+MaxAuthTries 3
+MaxSessions 2
+ClientAliveInterval 300
+ClientAliveCountMax 0
+X11Forwarding no
+AllowTcpForwarding no
+LogLevel VERBOSE
+AllowUsers moltbot-admin
+EOF
+
 systemctl restart sshd
 ```
 
-### Step 1.8: Verify Admin Access
+### Step 1.8: Test Admin Access
 
-**In a NEW terminal window** (keep the root session open):
+**In a NEW terminal:**
 
 ```bash
-# Test SSH access via your VPS IP (while still open)
 ssh moltbot-admin@your-vps-ip
-
-# Verify sudo works
 sudo whoami
 # Should output: root
 ```
 
-If this works, you can proceed. If not, use the root terminal to fix issues.
-
 ### Verification Checkpoint 1
 
-Run these commands to verify Phase 1:
-
 ```bash
-# Check firewall is active
 sudo ufw status
 # Expected: Status: active, deny incoming
 
-# Check auto-updates are enabled
 systemctl status unattended-upgrades
 # Expected: active (running)
 
-# Check SSH hardening
 sudo sshd -T | grep -E "permitrootlogin|passwordauthentication"
 # Expected: permitrootlogin no, passwordauthentication no
 ```
 
 ---
 
-## Phase 2: Install Core Dependencies
+## Phase 2: Install Docker & Core Dependencies
 
-### Step 2.1: Install Node.js 22.x (LTS)
+### Step 2.1: Install Docker
 
 ```bash
-# Switch to admin user if not already
 sudo -i
 
-# Install Node.js 22.x repository
-curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
-
-# Install Node.js
-apt install -y nodejs
-
-# Verify version (must be 22.12.0 or later for security patches)
-node --version
-# Expected: v22.x.x (at least v22.12.0)
-
-npm --version
-# Expected: 10.x.x
-```
-
-### Step 2.2: Install Docker
-
-```bash
 # Install prerequisites
-apt install -y \
-    ca-certificates \
-    curl \
-    gnupg \
-    lsb-release
+apt install -y ca-certificates curl gnupg lsb-release
 
-# Add Docker's official GPG key
+# Add Docker's GPG key
 install -m 0755 -d /etc/apt/keyrings
 curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
 chmod a+r /etc/apt/keyrings/docker.gpg
 
-# Add the repository
+# Add repository
 echo \
   "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
   $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
@@ -298,199 +253,155 @@ echo \
 apt update
 apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 
-# Verify Docker
-docker --version
-# Expected: Docker version 24.x.x or later
-
-# Enable Docker to start on boot
+# Enable and start
 systemctl enable docker
 systemctl start docker
+
+# Verify
+docker --version
+docker compose version
 ```
 
-### Step 2.3: Install Additional Security Tools
+### Step 2.2: Add Admin User to Docker Group
 
 ```bash
-# Install AppArmor utilities
-apt install -y apparmor apparmor-utils
+usermod -aG docker moltbot-admin
 
-# Install audit daemon
-apt install -y auditd audispd-plugins
+# Verify (need to re-login for group to take effect)
+groups moltbot-admin
+```
 
-# Install encryption tools
-apt install -y ecryptfs-utils cryptsetup
+### Step 2.3: Configure Docker Daemon for Security & Performance
 
-# Enable services
-systemctl enable apparmor auditd
-systemctl start apparmor auditd
+```bash
+cat > /etc/docker/daemon.json << 'EOF'
+{
+  "live-restore": true,
+  "userland-proxy": false,
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "3"
+  },
+  "storage-driver": "overlay2",
+  "default-ulimits": {
+    "nofile": {
+      "Name": "nofile",
+      "Hard": 65536,
+      "Soft": 65536
+    }
+  }
+}
+EOF
 
-# Verify AppArmor is running
-aa-status
-# Expected: apparmor module is loaded, profiles are in enforce mode
+systemctl restart docker
 ```
 
 ### Verification Checkpoint 2
 
 ```bash
-# Verify Node.js
-node --version && npm --version
-# Expected: v22.x.x and 10.x.x
+docker run --rm hello-world
+# Expected: "Hello from Docker!"
 
-# Verify Docker
-docker run hello-world
-# Expected: "Hello from Docker!" message
-
-# Verify AppArmor
-sudo aa-status | head -5
-# Expected: apparmor module is loaded
-
-# Verify auditd
-sudo systemctl status auditd
-# Expected: active (running)
+docker info | grep -E "Storage|Logging"
+# Expected: overlay2, json-file
 ```
 
 ---
 
-## Phase 3: Create Dedicated Moltbot User
+## Phase 3: Configure Persistent Storage
 
-### Step 3.1: Create the Moltbot Service User
+This is the critical phase for ensuring your Moltbot data survives container rebuilds.
+
+### Step 3.1: Create Persistent Directory Structure
 
 ```bash
-# Create moltbot user with restricted shell
-# -r: system account
-# -m: create home directory
-# -d: home directory path
-# -s: login shell (rbash = restricted bash)
-useradd -r -m -d /home/moltbot -s /bin/rbash -c "Moltbot Service Account" moltbot
+# Create the main moltbot data directory
+mkdir -p /opt/moltbot/{config,workspace,home,secrets,logs,backups}
 
-# Verify user creation
-id moltbot
-# Expected: uid=xxx(moltbot) gid=xxx(moltbot) groups=xxx(moltbot)
+# Set ownership (will be mapped to node user UID 1000 inside container)
+chown -R 1000:1000 /opt/moltbot/config
+chown -R 1000:1000 /opt/moltbot/workspace
+chown -R 1000:1000 /opt/moltbot/home
+chown -R 1000:1000 /opt/moltbot/logs
+
+# Secrets directory stays root-owned
+chmod 700 /opt/moltbot/secrets
 ```
 
-### Step 3.2: Set Up Restricted Shell Environment
+### Step 3.2: Configure Mount Options for Durability (Hetzner/SSD Optimization)
+
+If using a dedicated data partition or volume:
 
 ```bash
-# Create bin directory for allowed commands
-mkdir -p /home/moltbot/bin
+# Check your disk setup
+lsblk
+df -h
 
-# Link only necessary commands to the restricted bin
-ln -s /usr/bin/node /home/moltbot/bin/node
-ln -s /usr/bin/npm /home/moltbot/bin/npm
-ln -s /usr/bin/npx /home/moltbot/bin/npx
-ln -s /usr/bin/git /home/moltbot/bin/git
-ln -s /bin/ls /home/moltbot/bin/ls
-ln -s /bin/cat /home/moltbot/bin/cat
-ln -s /bin/mkdir /home/moltbot/bin/mkdir
-ln -s /bin/rm /home/moltbot/bin/rm
-ln -s /bin/cp /home/moltbot/bin/cp
-ln -s /bin/mv /home/moltbot/bin/mv
-ln -s /usr/bin/docker /home/moltbot/bin/docker
+# For Hetzner NVMe SSDs, optimize mount options
+# Edit /etc/fstab if you have a separate data partition:
+# /dev/nvme0n1p2 /opt/moltbot ext4 defaults,noatime,nodiratime,discard 0 2
 
-# Create restricted .bashrc
-cat > /home/moltbot/.bashrc << 'EOF'
-# Restricted bash configuration for moltbot
-export PATH="/home/moltbot/bin"
-export HOME="/home/moltbot"
-export SHELL="/bin/rbash"
-
-# Prevent modification of PATH
-readonly PATH
-readonly HOME
-readonly SHELL
-
-# Disable potentially dangerous operations
-set -r
-EOF
-
-# Create .profile
-cat > /home/moltbot/.profile << 'EOF'
-# Moltbot restricted profile
-if [ -f "$HOME/.bashrc" ]; then
-    . "$HOME/.bashrc"
-fi
-EOF
-
-# Lock down permissions
-chmod 755 /home/moltbot
-chmod 755 /home/moltbot/bin
-chmod 644 /home/moltbot/.bashrc
-chmod 644 /home/moltbot/.profile
-chown -R moltbot:moltbot /home/moltbot
+# For the root filesystem, you can remount with noatime
+mount -o remount,noatime /
 ```
 
-### Step 3.3: Add Moltbot to Docker Group (Limited)
+Add to `/etc/fstab` for persistence:
 
 ```bash
-# Add moltbot to docker group so it can run containers
-usermod -aG docker moltbot
+# Add noatime to root filesystem (reduces unnecessary writes)
+# Find your root device first:
+findmnt /
+
+# Edit fstab - change 'defaults' to 'defaults,noatime'
+nano /etc/fstab
+```
+
+### Step 3.3: Create Named Docker Volume for Home Persistence
+
+```bash
+# Create a named volume for complete home directory persistence
+docker volume create moltbot_home
 
 # Verify
-groups moltbot
-# Expected: moltbot : moltbot docker
+docker volume inspect moltbot_home
 ```
 
-### Step 3.4: Create Directory Structure
+### Step 3.4: Set Up Pre-populated Config Directory
 
 ```bash
-# Create moltbot directories
-mkdir -p /home/moltbot/{.clawdbot,moltbot,workspace,logs}
-mkdir -p /home/moltbot/.clawdbot/{agents,memory,metrics}
+# Create subdirectories that Moltbot expects
+mkdir -p /opt/moltbot/config/{agents,memory,metrics}
 
-# Set ownership
-chown -R moltbot:moltbot /home/moltbot
-
-# Set restrictive permissions on sensitive directories
-chmod 700 /home/moltbot/.clawdbot
-chmod 700 /home/moltbot/workspace
-chmod 755 /home/moltbot/logs
-```
-
-### Step 3.5: Configure Limited Sudo Access (Optional)
-
-Only add this if you need the bot to perform specific privileged operations:
-
-```bash
-# Create sudoers file with VERY limited permissions
-cat > /etc/sudoers.d/moltbot << 'EOF'
-# Moltbot limited sudo access
-# ONLY these specific commands are allowed
-
-# Allow restarting its own service (no args)
-moltbot ALL=(root) NOPASSWD: /usr/bin/systemctl restart moltbot.service
-moltbot ALL=(root) NOPASSWD: /usr/bin/systemctl status moltbot.service
-
-# Allow reading system logs (read-only operations)
-moltbot ALL=(root) NOPASSWD: /usr/bin/journalctl -u moltbot.service -n *
-
-# DENY everything else explicitly
-moltbot ALL=(ALL) !ALL
-EOF
-
-# Set correct permissions
-chmod 440 /etc/sudoers.d/moltbot
-
-# Validate sudoers file
-visudo -c
-# Expected: /etc/sudoers.d/moltbot: parsed OK
+# Set permissions
+chown -R 1000:1000 /opt/moltbot/config
+chmod 700 /opt/moltbot/config
 ```
 
 ### Verification Checkpoint 3
 
 ```bash
-# Verify user exists
-id moltbot
-
-# Verify restricted shell
-getent passwd moltbot | cut -d: -f7
-# Expected: /bin/rbash
-
 # Verify directory structure
-ls -la /home/moltbot/
-# Expected: directories with correct permissions
+tree -L 2 /opt/moltbot/
+# Expected:
+# /opt/moltbot/
+# ├── backups
+# ├── config
+# │   ├── agents
+# │   ├── memory
+# │   └── metrics
+# ├── home
+# ├── logs
+# ├── secrets
+# └── workspace
 
-# Verify sudo limits (should fail)
-sudo -u moltbot sudo ls /root
-# Expected: moltbot is not allowed to run 'sudo' as root
+# Verify ownership
+ls -la /opt/moltbot/
+# Expected: 1000:1000 for config, workspace, home, logs
+
+# Verify Docker volume
+docker volume ls | grep moltbot
+# Expected: moltbot_home
 ```
 
 ---
@@ -500,18 +411,15 @@ sudo -u moltbot sudo ls /root
 ### Step 4.1: Install Tailscale
 
 ```bash
-# Add Tailscale repository
 curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/$(lsb_release -cs).noarmor.gpg | \
     tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
 
 curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/$(lsb_release -cs).tailscale-keyring.list | \
     tee /etc/apt/sources.list.d/tailscale.list
 
-# Install
 apt update
 apt install -y tailscale
 
-# Enable service
 systemctl enable tailscaled
 systemctl start tailscaled
 ```
@@ -519,205 +427,152 @@ systemctl start tailscaled
 ### Step 4.2: Authenticate Tailscale
 
 ```bash
-# Start authentication (this will print a URL)
 tailscale up --ssh
 
-# You'll see output like:
-# To authenticate, visit:
-#   https://login.tailscale.com/a/xxxxxxxxxxxxx
+# Follow the URL to authenticate
+# Note your Tailscale IP: tailscale ip -4
 ```
 
-Open the URL in your browser and authenticate with your Tailscale account.
-
-### Step 4.3: Verify Tailscale Connection
+### Step 4.3: Configure Firewall for Tailscale-Only Access
 
 ```bash
-# Check Tailscale status
-tailscale status
-# Expected: Your machine and other devices listed
-
-# Get your Tailscale IP
-tailscale ip -4
-# Note this IP - you'll use it for SSH access
-```
-
-### Step 4.4: Configure Firewall to Allow Tailscale
-
-```bash
-# Allow SSH only over Tailscale interface
+# Allow SSH only over Tailscale
 ufw allow in on tailscale0 to any port 22 proto tcp comment 'SSH over Tailscale'
 
-# Verify
+# Verify and remove any internet SSH rules
 ufw status numbered
+ufw delete allow ssh 2>/dev/null || true
+ufw delete allow 22/tcp 2>/dev/null || true
+
+ufw status
 ```
 
-### Step 4.5: Test Tailscale SSH Access
+### Step 4.4: Test Tailscale Access
 
 From another device on your Tailnet:
 
 ```bash
-# SSH using Tailscale IP
-ssh moltbot-admin@100.x.x.x  # Your Tailscale IP
-
-# Or using Tailscale MagicDNS name
-ssh moltbot-admin@your-vps-name
-```
-
-### Step 4.6: Disable Direct Internet SSH (Final Lockdown)
-
-Once Tailscale SSH works:
-
-```bash
-# Remove any internet-facing SSH rules
-ufw delete allow ssh 2>/dev/null || true
-ufw delete allow 22/tcp 2>/dev/null || true
-
-# Verify only Tailscale SSH remains
-ufw status
-# Expected: Only "22/tcp on tailscale0" should show for SSH
+ssh moltbot-admin@<tailscale-ip>
 ```
 
 ### Verification Checkpoint 4
 
 ```bash
-# Verify Tailscale is connected
 tailscale status | head -5
-# Expected: Shows your machine as connected
+# Expected: Connected
 
-# Verify firewall
 sudo ufw status
-# Expected: Port 22 only allowed on tailscale0
-
-# Test SSH over Tailscale (from another device)
-ssh moltbot-admin@your-tailscale-ip
-# Expected: Successful login
+# Expected: Port 22 only on tailscale0
 ```
 
 ---
 
-## Phase 5: Install Moltbot
+## Phase 5: Set Up Telegram Bot
 
-### Step 5.1: Clone Moltbot Repository
+### Step 5.1: Create Telegram Bot
 
-```bash
-# Switch to moltbot user's directory
-cd /home/moltbot
+1. Open Telegram, search for `@BotFather`
+2. Send `/newbot`
+3. Follow prompts to name your bot
+4. **Copy the bot token** (format: `7123456789:AAH...`)
 
-# Clone as root (moltbot user has restricted shell)
-git clone https://github.com/moltbot/moltbot.git /home/moltbot/moltbot
+### Step 5.2: Get Your Chat ID
 
-# Set ownership
-chown -R moltbot:moltbot /home/moltbot/moltbot
+1. Search for `@userinfobot` on Telegram
+2. Send `/start`
+3. **Copy your user ID** (a number like `123456789`)
+
+### Step 5.3: Configure Bot Privacy
+
+Send to `@BotFather`:
+
+```
+/setprivacy → Select bot → Disable
+/setjoingroups → Select bot → Disable
+/setcommands → Select bot → Send:
+start - Start conversation
+help - Show help
+status - Check bot status
+clear - Clear conversation history
 ```
 
-### Step 5.2: Install Dependencies
+### Step 5.4: Save Your Credentials
 
 ```bash
-# Navigate to moltbot directory
-cd /home/moltbot/moltbot
-
-# Install npm dependencies as moltbot user
-sudo -u moltbot npm install
-
-# Build the project
-sudo -u moltbot npm run build
-```
-
-### Step 5.3: Verify Installation
-
-```bash
-# Check that build succeeded
-ls -la /home/moltbot/moltbot/dist/
-# Expected: JavaScript files present
-
-# Test that node can run the app (will fail without config, but validates install)
-sudo -u moltbot node /home/moltbot/moltbot/dist/index.js --help 2>&1 | head -5
-# Expected: Help output or config error (not "module not found")
-```
-
-### Step 5.4: Pull Docker Sandbox Image
-
-```bash
-# Pull the official sandbox image
-docker pull moltbot/sandbox:latest
-
-# Verify
-docker images | grep moltbot
-# Expected: moltbot/sandbox listed
-```
-
-### Verification Checkpoint 5
-
-```bash
-# Verify moltbot installation
-ls /home/moltbot/moltbot/dist/index.js
-# Expected: File exists
-
-# Verify npm packages
-ls /home/moltbot/moltbot/node_modules | wc -l
-# Expected: Large number (hundreds of packages)
-
-# Verify docker image
-docker images moltbot/sandbox
-# Expected: Image listed with tag "latest"
+# Note these down securely - you'll need them in Phase 6:
+# TELEGRAM_BOT_TOKEN=7123456789:AAHxxxxxxxxxxxxx
+# YOUR_CHAT_ID=123456789
 ```
 
 ---
 
-## Phase 6: Configure Moltbot Securely
+## Phase 6: Configure Moltbot Environment
 
-### Step 6.1: Create Secrets Storage
+### Step 6.1: Generate Gateway Token
 
 ```bash
-# Create secure secrets directory (root-owned)
-mkdir -p /etc/moltbot
-chmod 700 /etc/moltbot
+# Generate secure gateway token
+GATEWAY_TOKEN=$(openssl rand -hex 32)
+echo "Gateway Token: $GATEWAY_TOKEN"
+# Save this - you'll need it
+```
 
-# Create secrets file
-cat > /etc/moltbot/secrets.env << 'EOF'
-# Moltbot Secrets - DO NOT COMMIT TO VERSION CONTROL
-# Generated: $(date)
+### Step 6.2: Create Environment File
 
-# Anthropic API Key (get from console.anthropic.com)
+```bash
+cat > /opt/moltbot/secrets/.env << 'EOF'
+# ===========================================
+# MOLTBOT CONFIGURATION - SECRETS
+# ===========================================
+# DO NOT COMMIT THIS FILE TO VERSION CONTROL
+
+# --- Required: Gateway Authentication ---
+CLAWDBOT_GATEWAY_TOKEN=REPLACE_WITH_GATEWAY_TOKEN
+
+# --- Required: LLM Provider (at least one) ---
 ANTHROPIC_API_KEY=sk-ant-api03-REPLACE_WITH_YOUR_KEY
 
-# Telegram Bot Token (get from @BotFather)
-TELEGRAM_BOT_TOKEN=REPLACE_WITH_YOUR_TOKEN
-
-# Gateway authentication token (generate a random string)
-MOLTBOT_GATEWAY_TOKEN=REPLACE_WITH_RANDOM_STRING
-
-# OpenAI API Key (optional, for embeddings)
+# --- Optional: Additional Providers ---
 # OPENAI_API_KEY=sk-REPLACE_IF_NEEDED
+# OPENROUTER_API_KEY=REPLACE_IF_NEEDED
+
+# --- Required: Telegram ---
+TELEGRAM_BOT_TOKEN=REPLACE_WITH_BOT_TOKEN
+
+# --- Container Configuration ---
+CLAWDBOT_GATEWAY_BIND=loopback
+CLAWDBOT_GATEWAY_PORT=18789
+CLAWDBOT_BRIDGE_PORT=18790
+
+# --- Directory Mappings (used by docker-compose) ---
+CLAWDBOT_CONFIG_DIR=/opt/moltbot/config
+CLAWDBOT_WORKSPACE_DIR=/opt/moltbot/workspace
+CLAWDBOT_HOME_VOLUME=moltbot_home
+
+# --- Timezone ---
+TZ=UTC
 EOF
 
 # Set strict permissions
-chmod 600 /etc/moltbot/secrets.env
-chown root:moltbot /etc/moltbot/secrets.env
-
-# Allow moltbot group to read (but not write)
-chmod 640 /etc/moltbot/secrets.env
+chmod 600 /opt/moltbot/secrets/.env
+chown root:root /opt/moltbot/secrets/.env
 ```
 
-### Step 6.2: Generate Gateway Token
+### Step 6.3: Update Environment File with Your Values
 
 ```bash
-# Generate a secure random token
-GATEWAY_TOKEN=$(openssl rand -base64 32 | tr -d '/+=' | head -c 32)
-echo "Generated Gateway Token: $GATEWAY_TOKEN"
+nano /opt/moltbot/secrets/.env
 
-# Update the secrets file
-sed -i "s/MOLTBOT_GATEWAY_TOKEN=REPLACE_WITH_RANDOM_STRING/MOLTBOT_GATEWAY_TOKEN=$GATEWAY_TOKEN/" /etc/moltbot/secrets.env
-
-# Verify
-grep MOLTBOT_GATEWAY_TOKEN /etc/moltbot/secrets.env
+# Replace:
+# - CLAWDBOT_GATEWAY_TOKEN with your generated token
+# - ANTHROPIC_API_KEY with your Anthropic API key
+# - TELEGRAM_BOT_TOKEN with your bot token from BotFather
 ```
 
-### Step 6.3: Create Main Configuration File
+### Step 6.4: Create Moltbot Configuration File
 
 ```bash
-# Create the moltbot configuration
-cat > /home/moltbot/.clawdbot/moltbot.json << 'JSONEOF'
+cat > /opt/moltbot/config/moltbot.json << 'JSONEOF'
 {
   "$schema": "https://moltbot.github.io/schema/config.json",
 
@@ -726,11 +581,7 @@ cat > /home/moltbot/.clawdbot/moltbot.json << 'JSONEOF'
     "port": 18789,
     "auth": {
       "required": true,
-      "token": "${MOLTBOT_GATEWAY_TOKEN}"
-    },
-    "rateLimit": {
-      "enabled": true,
-      "maxRequestsPerMinute": 30
+      "token": "${CLAWDBOT_GATEWAY_TOKEN}"
     }
   },
 
@@ -738,24 +589,6 @@ cat > /home/moltbot/.clawdbot/moltbot.json << 'JSONEOF'
     "defaults": {
       "model": "claude-sonnet-4-20250514",
       "contextWindow": 128000,
-
-      "sandbox": {
-        "mode": "always",
-        "docker": {
-          "image": "moltbot/sandbox:latest",
-          "readOnly": false,
-          "capDrop": ["ALL"],
-          "capAdd": [],
-          "securityOpt": ["no-new-privileges:true"],
-          "networkMode": "bridge",
-          "memoryLimit": "512m",
-          "cpuLimit": "1.0",
-          "tmpfs": {
-            "/tmp": "size=100m,noexec,nosuid"
-          },
-          "timeout": 300000
-        }
-      },
 
       "tools": {
         "allowlist": [
@@ -794,10 +627,6 @@ cat > /home/moltbot/.clawdbot/moltbot.json << 'JSONEOF'
             "vectorWeight": 0.7,
             "textWeight": 0.3
           }
-        },
-        "sync": {
-          "watch": true,
-          "watchDebounceMs": 2000
         }
       },
 
@@ -810,7 +639,7 @@ cat > /home/moltbot/.clawdbot/moltbot.json << 'JSONEOF'
       },
 
       "workspaceAccess": "rw",
-      "workspacePath": "/home/moltbot/workspace"
+      "workspacePath": "/home/node/clawd"
     }
   },
 
@@ -824,7 +653,7 @@ cat > /home/moltbot/.clawdbot/moltbot.json << 'JSONEOF'
       },
       "idle": {
         "enabled": true,
-        "minutes": 60
+        "minutes": 120
       }
     }
   },
@@ -833,529 +662,195 @@ cat > /home/moltbot/.clawdbot/moltbot.json << 'JSONEOF'
     "telegram": {
       "enabled": true,
       "botToken": "${TELEGRAM_BOT_TOKEN}",
-      "allowedChatIds": [],
+      "allowedChatIds": [REPLACE_WITH_YOUR_CHAT_ID],
       "dmPolicy": "reject",
-      "groupPolicy": "ignore",
-      "rateLimit": {
-        "messagesPerMinute": 20
-      }
+      "groupPolicy": "ignore"
     }
   },
 
   "logging": {
-    "level": "info",
-    "file": "/home/moltbot/logs/moltbot.log",
-    "maxSize": "50m",
-    "maxFiles": 5,
-    "compress": true
-  },
-
-  "metrics": {
-    "enabled": true,
-    "path": "/home/moltbot/.clawdbot/metrics/quality.jsonl"
+    "level": "info"
   }
 }
 JSONEOF
 
-# Set ownership and permissions
-chown moltbot:moltbot /home/moltbot/.clawdbot/moltbot.json
-chmod 600 /home/moltbot/.clawdbot/moltbot.json
+# Set ownership for container user
+chown 1000:1000 /opt/moltbot/config/moltbot.json
+chmod 600 /opt/moltbot/config/moltbot.json
 ```
 
-### Step 6.4: Update Your API Keys
-
-Now edit the secrets file with your actual credentials:
+### Step 6.5: Update Chat ID in Config
 
 ```bash
-# Edit secrets file
-nano /etc/moltbot/secrets.env
+# Replace REPLACE_WITH_YOUR_CHAT_ID with your actual chat ID
+YOUR_CHAT_ID=123456789  # Use your actual ID
+sed -i "s/REPLACE_WITH_YOUR_CHAT_ID/$YOUR_CHAT_ID/" /opt/moltbot/config/moltbot.json
 
-# Replace:
-# - ANTHROPIC_API_KEY with your key from console.anthropic.com
-# - TELEGRAM_BOT_TOKEN with your token from @BotFather (next section)
+# Verify
+grep allowedChatIds /opt/moltbot/config/moltbot.json
 ```
 
 ### Verification Checkpoint 6
 
 ```bash
-# Verify secrets file permissions
-ls -la /etc/moltbot/secrets.env
-# Expected: -rw-r----- 1 root moltbot
+# Verify secrets file
+ls -la /opt/moltbot/secrets/.env
+# Expected: -rw------- 1 root root
 
-# Verify config file exists and is valid JSON
-sudo -u moltbot cat /home/moltbot/.clawdbot/moltbot.json | jq . > /dev/null && echo "Valid JSON"
+# Verify config file (valid JSON)
+cat /opt/moltbot/config/moltbot.json | jq . > /dev/null && echo "Valid JSON"
 # Expected: "Valid JSON"
 
-# Verify config permissions
-ls -la /home/moltbot/.clawdbot/moltbot.json
-# Expected: -rw------- 1 moltbot moltbot
+# Verify environment variables are set (without showing secrets)
+grep -c "REPLACE" /opt/moltbot/secrets/.env
+# Expected: 0 (no unreplaced placeholders)
 ```
 
 ---
 
-## Phase 7: Set Up Telegram Integration
+## Phase 7: Deploy Moltbot Container
 
-### Step 7.1: Create Telegram Bot
-
-1. Open Telegram and search for `@BotFather`
-2. Send `/newbot`
-3. Follow prompts to name your bot
-4. Copy the bot token provided
-
-### Step 7.2: Get Your Chat ID
-
-1. Search for `@userinfobot` on Telegram
-2. Send `/start`
-3. It will reply with your user ID (a number like `123456789`)
-4. Copy this number
-
-### Step 7.3: Update Configuration with Chat ID
+### Step 7.1: Create Docker Compose File
 
 ```bash
-# Edit the moltbot config to add your chat ID
-nano /home/moltbot/.clawdbot/moltbot.json
+cat > /opt/moltbot/docker-compose.yml << 'EOF'
+version: "3.8"
 
-# Find the "allowedChatIds" line and add your ID:
-# "allowedChatIds": [123456789],
+services:
+  moltbot-gateway:
+    image: ghcr.io/moltbot/moltbot:latest
+    container_name: moltbot-gateway
+    restart: unless-stopped
+
+    # Environment
+    env_file:
+      - /opt/moltbot/secrets/.env
+    environment:
+      - HOME=/home/node
+      - TERM=xterm-256color
+      - NODE_ENV=production
+
+    # Persistent Volume Mounts
+    volumes:
+      # Primary config/data persistence (sessions, memory, settings)
+      - /opt/moltbot/config:/home/node/.clawdbot:rw
+
+      # Workspace persistence (user projects/files)
+      - /opt/moltbot/workspace:/home/node/clawd:rw
+
+      # Full home directory persistence (npm cache, shell history, etc.)
+      - moltbot_home:/home/node:rw
+
+      # Logs persistence
+      - /opt/moltbot/logs:/home/node/logs:rw
+
+      # Docker socket for DinD sandbox capabilities
+      - /var/run/docker.sock:/var/run/docker.sock:rw
+
+    # Network - bind to localhost only (accessed via Tailscale SSH tunnel)
+    ports:
+      - "127.0.0.1:18789:18789"
+      - "127.0.0.1:18790:18790"
+
+    # Process management
+    init: true
+    stop_grace_period: 30s
+
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "2.0"
+        reservations:
+          memory: 512M
+          cpus: "0.5"
+
+    # Security options
+    security_opt:
+      - no-new-privileges:true
+
+    # Healthcheck
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:18789/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+    # Startup command
+    command: >
+      node dist/index.js gateway
+      --bind loopback
+      --port 18789
+
+volumes:
+  moltbot_home:
+    external: true
+    name: moltbot_home
+
+networks:
+  default:
+    driver: bridge
+EOF
 ```
 
-Or use sed:
+### Step 7.2: Pull the Moltbot Image
 
 ```bash
-# Replace YOUR_CHAT_ID with your actual numeric chat ID
-YOUR_CHAT_ID=123456789
-sed -i "s/\"allowedChatIds\": \[\]/\"allowedChatIds\": [$YOUR_CHAT_ID]/" /home/moltbot/.clawdbot/moltbot.json
-
-# Verify
-grep allowedChatIds /home/moltbot/.clawdbot/moltbot.json
+cd /opt/moltbot
+docker compose pull
 ```
 
-### Step 7.4: Update Secrets with Bot Token
+### Step 7.3: Start Moltbot
 
 ```bash
-# Edit secrets file
-nano /etc/moltbot/secrets.env
+cd /opt/moltbot
+docker compose up -d
 
-# Replace TELEGRAM_BOT_TOKEN with your actual token from BotFather
-# Example: TELEGRAM_BOT_TOKEN=7123456789:AAHxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+# Check logs
+docker compose logs -f
+# Press Ctrl+C to exit logs
 ```
 
-### Step 7.5: Configure Telegram Privacy Settings
+### Step 7.4: Verify Container is Running
 
-Send these commands to `@BotFather`:
+```bash
+# Check container status
+docker compose ps
+# Expected: moltbot-gateway running (healthy)
 
-```
-/setprivacy
-Select your bot
-Disable  (so bot only sees messages directed at it in groups)
+# Check gateway is listening
+ss -tlnp | grep 18789
+# Expected: 127.0.0.1:18789
 
-/setjoingroups
-Select your bot
-Disable  (prevent bot from being added to groups)
-
-/setcommands
-Select your bot
-Send:
-start - Start conversation
-help - Show help
-status - Check bot status
-clear - Clear conversation history
+# Check container logs
+docker compose logs --tail 50
 ```
 
 ### Verification Checkpoint 7
 
 ```bash
-# Verify Telegram config
-grep -A5 '"telegram"' /home/moltbot/.clawdbot/moltbot.json
-# Expected: Shows your config with allowedChatIds populated
+# Verify container is running
+docker ps | grep moltbot
+# Expected: moltbot-gateway Up (healthy)
 
-# Verify bot token is set (partial match for security)
-grep TELEGRAM_BOT_TOKEN /etc/moltbot/secrets.env | cut -c1-30
-# Expected: TELEGRAM_BOT_TOKEN=7xxxxxxx (shows beginning of token)
+# Verify mounts
+docker inspect moltbot-gateway | jq '.[0].Mounts'
+# Expected: Shows all bind mounts and volumes
+
+# Verify gateway responds
+curl -s http://127.0.0.1:18789/health || echo "Health endpoint may not exist - check logs"
+
+# Test Telegram (send a message to your bot)
+# Should receive a response
 ```
 
 ---
 
-## Phase 8: Implement Docker Sandboxing
+## Phase 8: Harden Docker & Network
 
-### Step 8.1: Create Custom Sandbox Network
-
-```bash
-# Create isolated Docker network for sandboxes
-docker network create \
-    --driver bridge \
-    --subnet 172.30.0.0/24 \
-    --opt com.docker.network.bridge.enable_ip_masquerade=false \
-    moltbot-sandbox-net
-
-# Verify
-docker network ls | grep moltbot
-```
-
-### Step 8.2: Configure Docker Daemon Security
-
-```bash
-# Create Docker daemon configuration
-cat > /etc/docker/daemon.json << 'EOF'
-{
-  "live-restore": true,
-  "userland-proxy": false,
-  "no-new-privileges": true,
-  "seccomp-profile": "/etc/docker/seccomp-default.json",
-  "log-driver": "json-file",
-  "log-opts": {
-    "max-size": "10m",
-    "max-file": "3"
-  },
-  "storage-driver": "overlay2",
-  "default-ulimits": {
-    "nofile": {
-      "Name": "nofile",
-      "Hard": 1024,
-      "Soft": 1024
-    },
-    "nproc": {
-      "Name": "nproc",
-      "Hard": 256,
-      "Soft": 256
-    }
-  }
-}
-EOF
-
-# Restart Docker to apply
-systemctl restart docker
-
-# Verify
-docker info | grep -E "Security|Seccomp"
-```
-
-### Step 8.3: Create Seccomp Profile
-
-```bash
-# Download default seccomp profile
-curl -L https://raw.githubusercontent.com/moby/moby/master/profiles/seccomp/default.json \
-    -o /etc/docker/seccomp-default.json
-
-# Verify
-ls -la /etc/docker/seccomp-default.json
-```
-
-### Step 8.4: Test Sandbox Container
-
-```bash
-# Test running a sandbox container as moltbot
-sudo -u moltbot docker run --rm \
-    --security-opt no-new-privileges:true \
-    --cap-drop ALL \
-    --memory 512m \
-    --cpus 1.0 \
-    --read-only \
-    --tmpfs /tmp:size=100m,noexec,nosuid \
-    moltbot/sandbox:latest \
-    echo "Sandbox test successful"
-
-# Expected: "Sandbox test successful"
-```
-
-### Verification Checkpoint 8
-
-```bash
-# Verify Docker network
-docker network inspect moltbot-sandbox-net | jq '.[0].IPAM'
-# Expected: Shows subnet 172.30.0.0/24
-
-# Verify Docker security settings
-docker info 2>/dev/null | grep -E "Security|Seccomp"
-# Expected: Shows security options enabled
-
-# Verify moltbot can run containers
-sudo -u moltbot docker ps
-# Expected: Empty list (no error)
-```
-
----
-
-## Phase 9: Configure AppArmor Mandatory Access Control
-
-### Step 9.1: Create Moltbot AppArmor Profile
-
-```bash
-cat > /etc/apparmor.d/moltbot << 'EOF'
-#include <tunables/global>
-
-profile moltbot /usr/bin/node {
-  #include <abstractions/base>
-  #include <abstractions/nameservice>
-  #include <abstractions/openssl>
-  #include <abstractions/ssl_certs>
-
-  # Node.js binary and libraries
-  /usr/bin/node mr,
-  /usr/lib/node_modules/** r,
-  /usr/share/nodejs/** r,
-
-  # Moltbot installation (read-only for code)
-  /home/moltbot/moltbot/** r,
-  /home/moltbot/moltbot/node_modules/** r,
-  /home/moltbot/moltbot/dist/** r,
-
-  # Moltbot data directories (read-write)
-  /home/moltbot/.clawdbot/** rw,
-  /home/moltbot/.clawdbot/agents/**/sessions/** rw,
-  /home/moltbot/.clawdbot/memory/** rw,
-  /home/moltbot/.clawdbot/metrics/** rw,
-  /home/moltbot/workspace/** rw,
-  /home/moltbot/logs/** rw,
-
-  # Temporary files
-  /tmp/** rw,
-  /var/tmp/** rw,
-
-  # Node.js needs these
-  /proc/*/maps r,
-  /proc/sys/kernel/random/uuid r,
-  /sys/devices/system/cpu/** r,
-
-  # Network access (required for Telegram/API)
-  network inet stream,
-  network inet6 stream,
-  network inet dgram,
-  network inet6 dgram,
-
-  # Docker socket (for sandbox management)
-  /var/run/docker.sock rw,
-
-  # Secrets file (read-only)
-  /etc/moltbot/secrets.env r,
-
-  # Deny dangerous paths explicitly
-  deny /etc/shadow r,
-  deny /etc/gshadow r,
-  deny /etc/passwd w,
-  deny /etc/group w,
-  deny /etc/sudoers* rw,
-  deny /etc/ssh/** w,
-  deny /root/** rwx,
-  deny /home/moltbot-admin/** rwx,
-  deny /boot/** rwx,
-  deny /usr/bin/* w,
-  deny /usr/sbin/* w,
-  deny /bin/* w,
-  deny /sbin/* w,
-
-  # Deny access to other users' homes
-  deny /home/*/.ssh/** rwx,
-  deny /home/*/.gnupg/** rwx,
-  deny /home/*/.aws/** rwx,
-
-  # Deny raw device access
-  deny /dev/sd* rwx,
-  deny /dev/nvme* rwx,
-  deny /dev/mem rwx,
-  deny /dev/kmem rwx,
-}
-EOF
-```
-
-### Step 9.2: Load and Enforce the Profile
-
-```bash
-# Parse and load the profile
-apparmor_parser -r /etc/apparmor.d/moltbot
-
-# Set to enforce mode
-aa-enforce moltbot
-
-# Verify
-aa-status | grep moltbot
-# Expected: moltbot (enforce)
-```
-
-### Step 9.3: Test AppArmor Restrictions
-
-```bash
-# Test that moltbot cannot read shadow file
-sudo -u moltbot cat /etc/shadow 2>&1
-# Expected: Permission denied (enforced by AppArmor)
-
-# Test that moltbot can read its own config
-sudo -u moltbot cat /home/moltbot/.clawdbot/moltbot.json | head -3
-# Expected: Shows JSON content
-```
-
-### Verification Checkpoint 9
-
-```bash
-# Verify AppArmor profile is loaded
-sudo aa-status | grep -A2 "profiles are in enforce mode"
-# Expected: moltbot listed
-
-# Verify profile denies sensitive access
-sudo -u moltbot cat /etc/shadow 2>&1 | grep -i denied
-# Expected: Shows permission denied
-
-# Check AppArmor logs
-sudo dmesg | grep -i apparmor | tail -5
-# Expected: May show DENIED entries for blocked access
-```
-
----
-
-## Phase 10: Set Up Audit Logging
-
-### Step 10.1: Configure Auditd Rules
-
-```bash
-# Create moltbot-specific audit rules
-cat > /etc/audit/rules.d/moltbot.rules << 'EOF'
-# Moltbot Audit Rules
-# Monitor all activity by the moltbot user
-
-# Delete all existing rules (clean slate for this file)
--D
-
-# Set buffer size
--b 8192
-
-# Log all commands executed by moltbot
--a always,exit -F arch=b64 -F uid=moltbot -S execve -k moltbot_exec
-
-# Log file modifications in sensitive areas
--w /etc/passwd -p wa -k moltbot_sensitive
--w /etc/shadow -p wa -k moltbot_sensitive
--w /etc/sudoers -p wa -k moltbot_sensitive
--w /etc/ssh/sshd_config -p wa -k moltbot_sensitive
-
-# Log moltbot data directory changes
--w /home/moltbot/.clawdbot -p wa -k moltbot_data
-
-# Log moltbot config changes
--w /home/moltbot/.clawdbot/moltbot.json -p wa -k moltbot_config
-
-# Log secrets file access
--w /etc/moltbot/secrets.env -p r -k moltbot_secrets
-
-# Log network connections by moltbot
--a always,exit -F arch=b64 -F uid=moltbot -S connect -k moltbot_network
--a always,exit -F arch=b64 -F uid=moltbot -S socket -k moltbot_network
-
-# Log privilege escalation attempts
--a always,exit -F arch=b64 -F uid=moltbot -S setuid -k moltbot_privesc
--a always,exit -F arch=b64 -F uid=moltbot -S setgid -k moltbot_privesc
-
-# Log Docker operations
--w /var/run/docker.sock -p rwxa -k moltbot_docker
-
-# Make the configuration immutable (requires reboot to change)
--e 2
-EOF
-
-# Load the rules
-augenrules --load
-
-# Verify rules are loaded
-auditctl -l | grep moltbot
-```
-
-### Step 10.2: Configure Log Rotation for Audit Logs
-
-```bash
-cat > /etc/audit/auditd.conf << 'EOF'
-log_file = /var/log/audit/audit.log
-log_format = ENRICHED
-log_group = adm
-priority_boost = 4
-flush = INCREMENTAL_ASYNC
-freq = 50
-num_logs = 10
-max_log_file = 50
-max_log_file_action = ROTATE
-space_left = 75
-space_left_action = SYSLOG
-admin_space_left = 50
-admin_space_left_action = SUSPEND
-disk_full_action = SUSPEND
-disk_error_action = SUSPEND
-tcp_listen_queue = 5
-tcp_max_per_addr = 1
-tcp_client_max_idle = 0
-enable_krb5 = no
-krb5_principal = auditd
-distribute_network = no
-EOF
-
-# Restart auditd
-systemctl restart auditd
-```
-
-### Step 10.3: Create Audit Log Search Script
-
-```bash
-cat > /usr/local/bin/moltbot-audit << 'EOF'
-#!/bin/bash
-# Search moltbot audit logs
-# Usage: moltbot-audit [hours]
-
-HOURS=${1:-24}
-START=$(date -d "$HOURS hours ago" '+%m/%d/%Y %H:%M:%S')
-
-echo "=== Moltbot Audit Log (last $HOURS hours) ==="
-echo ""
-
-echo "--- Commands Executed ---"
-ausearch -k moltbot_exec --start "$START" 2>/dev/null | aureport -x --summary
-
-echo ""
-echo "--- Sensitive File Access ---"
-ausearch -k moltbot_sensitive --start "$START" 2>/dev/null | aureport -f --summary
-
-echo ""
-echo "--- Network Connections ---"
-ausearch -k moltbot_network --start "$START" 2>/dev/null | head -20
-
-echo ""
-echo "--- Docker Operations ---"
-ausearch -k moltbot_docker --start "$START" 2>/dev/null | aureport -x --summary
-
-echo ""
-echo "--- Full log available at: /var/log/audit/audit.log ---"
-EOF
-
-chmod +x /usr/local/bin/moltbot-audit
-```
-
-### Verification Checkpoint 10
-
-```bash
-# Verify audit rules
-sudo auditctl -l | grep moltbot | wc -l
-# Expected: 10+ rules
-
-# Generate test event
-sudo -u moltbot ls /etc/ > /dev/null
-
-# Check for audit event
-sudo ausearch -k moltbot_exec --raw | tail -1
-# Expected: Shows recent event
-
-# Test the audit script
-sudo moltbot-audit 1
-# Expected: Shows audit summary
-```
-
----
-
-## Phase 11: Configure Network Egress Filtering
-
-### Step 11.1: Identify Required Destinations
-
-Moltbot needs to reach:
-- `api.anthropic.com` (Claude API)
-- `api.telegram.org` (Telegram Bot API)
-- `github.com` / `raw.githubusercontent.com` (for updates, optional)
-
-### Step 11.2: Create IP Sets for Allowed Destinations
+### Step 8.1: Create Network Egress Rules
 
 ```bash
 # Install ipset
@@ -1364,299 +859,171 @@ apt install -y ipset
 # Create IP set for allowed destinations
 ipset create moltbot_allowed hash:net
 
-# Resolve and add Anthropic API IPs
-for ip in $(dig +short api.anthropic.com); do
-    ipset add moltbot_allowed $ip
+# Add API endpoints
+for ip in $(dig +short api.anthropic.com 2>/dev/null); do
+    ipset add moltbot_allowed $ip 2>/dev/null || true
 done
 
-# Resolve and add Telegram API IPs
-for ip in $(dig +short api.telegram.org); do
-    ipset add moltbot_allowed $ip
+for ip in $(dig +short api.telegram.org 2>/dev/null); do
+    ipset add moltbot_allowed $ip 2>/dev/null || true
 done
 
-# Add Telegram CDN ranges (149.154.160.0/20, 91.108.4.0/22)
+# Add Telegram CDN ranges
 ipset add moltbot_allowed 149.154.160.0/20
 ipset add moltbot_allowed 91.108.4.0/22
 
-# Add GitHub (optional, for updates)
-for ip in $(dig +short github.com); do
-    ipset add moltbot_allowed $ip
+# Add GitHub (for updates)
+for ip in $(dig +short github.com 2>/dev/null); do
+    ipset add moltbot_allowed $ip 2>/dev/null || true
+done
+for ip in $(dig +short ghcr.io 2>/dev/null); do
+    ipset add moltbot_allowed $ip 2>/dev/null || true
 done
 
 # Verify
 ipset list moltbot_allowed
 ```
 
-### Step 11.3: Create iptables Rules
-
-```bash
-# Get moltbot UID
-MOLTBOT_UID=$(id -u moltbot)
-
-# Allow established connections
-iptables -A OUTPUT -m owner --uid-owner $MOLTBOT_UID -m state --state ESTABLISHED,RELATED -j ACCEPT
-
-# Allow DNS (required for API resolution)
-iptables -A OUTPUT -m owner --uid-owner $MOLTBOT_UID -p udp --dport 53 -j ACCEPT
-iptables -A OUTPUT -m owner --uid-owner $MOLTBOT_UID -p tcp --dport 53 -j ACCEPT
-
-# Allow localhost (for Gateway)
-iptables -A OUTPUT -m owner --uid-owner $MOLTBOT_UID -d 127.0.0.0/8 -j ACCEPT
-
-# Allow Docker bridge networks
-iptables -A OUTPUT -m owner --uid-owner $MOLTBOT_UID -d 172.16.0.0/12 -j ACCEPT
-
-# Allow HTTPS to permitted destinations
-iptables -A OUTPUT -m owner --uid-owner $MOLTBOT_UID -p tcp --dport 443 -m set --match-set moltbot_allowed dst -j ACCEPT
-
-# Log blocked connections
-iptables -A OUTPUT -m owner --uid-owner $MOLTBOT_UID -j LOG --log-prefix "MOLTBOT_BLOCKED: " --log-level 4
-
-# Block everything else from moltbot
-iptables -A OUTPUT -m owner --uid-owner $MOLTBOT_UID -j DROP
-```
-
-### Step 11.4: Persist iptables Rules
-
-```bash
-# Install iptables-persistent
-apt install -y iptables-persistent
-
-# Save rules
-netfilter-persistent save
-
-# Verify persistence
-cat /etc/iptables/rules.v4 | grep moltbot
-```
-
-### Step 11.5: Create IP Set Update Script
-
-API IPs can change, so create a refresh script:
+### Step 8.2: Create IP Set Update Script
 
 ```bash
 cat > /usr/local/bin/moltbot-update-ipset << 'EOF'
 #!/bin/bash
-# Update moltbot allowed IP set with current API IPs
-
 set -e
 
-# Flush existing entries (keep the set)
-ipset flush moltbot_allowed
+ipset flush moltbot_allowed 2>/dev/null || ipset create moltbot_allowed hash:net
 
-# Re-add API endpoints
-for host in api.anthropic.com api.telegram.org github.com; do
+for host in api.anthropic.com api.telegram.org github.com ghcr.io; do
     for ip in $(dig +short $host 2>/dev/null); do
-        [[ $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && ipset add moltbot_allowed $ip 2>/dev/null || true
+        [[ $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && \
+            ipset add moltbot_allowed $ip 2>/dev/null || true
     done
 done
 
 # Static Telegram ranges
-ipset add moltbot_allowed 149.154.160.0/20
-ipset add moltbot_allowed 91.108.4.0/22
+ipset add moltbot_allowed 149.154.160.0/20 2>/dev/null || true
+ipset add moltbot_allowed 91.108.4.0/22 2>/dev/null || true
 
 echo "Updated moltbot_allowed ipset at $(date)"
-ipset list moltbot_allowed | head -10
 EOF
 
 chmod +x /usr/local/bin/moltbot-update-ipset
 
-# Add to cron (run daily)
+# Add to daily cron
 echo "0 4 * * * root /usr/local/bin/moltbot-update-ipset >> /var/log/moltbot-ipset.log 2>&1" > /etc/cron.d/moltbot-ipset
 ```
 
-### Verification Checkpoint 11
+### Step 8.3: Configure Container Egress Filtering (Optional)
+
+For stricter control, you can use iptables to filter Docker container traffic:
+
+```bash
+# Get the Docker bridge network subnet
+DOCKER_SUBNET=$(docker network inspect bridge | jq -r '.[0].IPAM.Config[0].Subnet')
+
+# Allow established connections
+iptables -I DOCKER-USER -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+# Allow DNS
+iptables -I DOCKER-USER -p udp --dport 53 -j ACCEPT
+iptables -I DOCKER-USER -p tcp --dport 53 -j ACCEPT
+
+# Allow HTTPS to permitted destinations
+iptables -I DOCKER-USER -p tcp --dport 443 -m set --match-set moltbot_allowed dst -j ACCEPT
+
+# Log other outbound (for debugging)
+iptables -A DOCKER-USER -j LOG --log-prefix "DOCKER_EGRESS: " --log-level 4
+
+# Save rules
+apt install -y iptables-persistent
+netfilter-persistent save
+```
+
+### Verification Checkpoint 8
 
 ```bash
 # Verify ipset
-sudo ipset list moltbot_allowed | head -15
-# Expected: Shows IP addresses
+ipset list moltbot_allowed | head -10
+# Expected: Shows IPs
 
-# Verify iptables rules
-sudo iptables -L OUTPUT -n -v | grep moltbot
-# Expected: Shows rules for moltbot UID
-
-# Test allowed connection (as moltbot)
-sudo -u moltbot curl -s -o /dev/null -w "%{http_code}" https://api.anthropic.com/v1/messages
-# Expected: 401 (unauthorized, but connection allowed)
-
-# Test blocked connection (should fail)
-sudo -u moltbot curl -s --connect-timeout 5 https://evil-site.example.com 2>&1
-# Expected: Connection timeout or refused
-
-# Check for blocked log entries
-sudo dmesg | grep MOLTBOT_BLOCKED | tail -3
+# Test container can reach Telegram
+docker exec moltbot-gateway curl -s -o /dev/null -w "%{http_code}" https://api.telegram.org
+# Expected: 200 or 404 (connection works)
 ```
 
 ---
 
-## Phase 12: Create Systemd Service with Hardening
+## Phase 9: Set Up Monitoring & Logging
 
-### Step 12.1: Create the Service File
-
-```bash
-cat > /etc/systemd/system/moltbot.service << 'EOF'
-[Unit]
-Description=Moltbot AI Assistant
-Documentation=https://docs.molt.bot
-After=network-online.target docker.service
-Wants=network-online.target
-Requires=docker.service
-
-[Service]
-Type=simple
-User=moltbot
-Group=moltbot
-WorkingDirectory=/home/moltbot/moltbot
-
-# Environment
-EnvironmentFile=/etc/moltbot/secrets.env
-Environment="NODE_ENV=production"
-Environment="HOME=/home/moltbot"
-
-# Execute
-ExecStart=/usr/bin/node /home/moltbot/moltbot/dist/index.js
-ExecReload=/bin/kill -HUP $MAINPID
-
-# Restart policy
-Restart=on-failure
-RestartSec=10
-StartLimitIntervalSec=300
-StartLimitBurst=5
-
-# Resource limits
-LimitNOFILE=4096
-LimitNPROC=256
-MemoryMax=1G
-CPUQuota=100%
-
-# Security hardening
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=read-only
-PrivateTmp=true
-PrivateDevices=true
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectControlGroups=true
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
-RestrictNamespaces=true
-RestrictRealtime=true
-RestrictSUIDSGID=true
-LockPersonality=true
-MemoryDenyWriteExecute=false
-SystemCallArchitectures=native
-
-# Allow read-write to specific paths
-ReadWritePaths=/home/moltbot/.clawdbot
-ReadWritePaths=/home/moltbot/workspace
-ReadWritePaths=/home/moltbot/logs
-ReadWritePaths=/var/run/docker.sock
-
-# AppArmor profile
-AppArmorProfile=moltbot
-
-# Logging
-StandardOutput=append:/home/moltbot/logs/moltbot-stdout.log
-StandardError=append:/home/moltbot/logs/moltbot-stderr.log
-SyslogIdentifier=moltbot
-
-[Install]
-WantedBy=multi-user.target
-EOF
-```
-
-### Step 12.2: Create Log Rotation
+### Step 9.1: Create Log Rotation
 
 ```bash
 cat > /etc/logrotate.d/moltbot << 'EOF'
-/home/moltbot/logs/*.log {
+/opt/moltbot/logs/*.log {
     daily
     rotate 14
     compress
     delaycompress
     missingok
     notifempty
-    create 640 moltbot moltbot
-    sharedscripts
-    postrotate
-        systemctl reload moltbot 2>/dev/null || true
-    endscript
+    create 644 1000 1000
 }
 
-/home/moltbot/.clawdbot/agents/*/sessions/*.jsonl {
+/opt/moltbot/config/agents/*/sessions/*.jsonl {
     weekly
     rotate 8
     compress
     delaycompress
     missingok
     notifempty
-    create 600 moltbot moltbot
+    create 600 1000 1000
 }
 EOF
 ```
 
-### Step 12.3: Reload and Enable Service
+### Step 9.2: Create Monitoring Script
 
 ```bash
-# Reload systemd
-systemctl daemon-reload
+cat > /usr/local/bin/moltbot-status << 'EOF'
+#!/bin/bash
 
-# Enable service to start on boot
-systemctl enable moltbot.service
+echo "=========================================="
+echo "  MOLTBOT STATUS"
+echo "  $(date)"
+echo "=========================================="
+echo ""
 
-# Verify service file
-systemd-analyze verify moltbot.service
-# Expected: No errors (warnings about AppArmor are OK)
+echo "--- CONTAINER STATUS ---"
+docker ps --filter name=moltbot --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+
+echo ""
+echo "--- RESOURCE USAGE ---"
+docker stats moltbot-gateway --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}"
+
+echo ""
+echo "--- DISK USAGE ---"
+du -sh /opt/moltbot/*
+
+echo ""
+echo "--- RECENT LOGS ---"
+docker logs moltbot-gateway --tail 10 2>&1
+
+echo ""
+echo "--- TAILSCALE STATUS ---"
+tailscale status | head -3
+EOF
+
+chmod +x /usr/local/bin/moltbot-status
 ```
 
-### Step 12.4: Start Moltbot
-
-```bash
-# Start the service
-systemctl start moltbot.service
-
-# Check status
-systemctl status moltbot.service
-
-# View logs
-journalctl -u moltbot.service -f
-```
-
-### Verification Checkpoint 12
-
-```bash
-# Verify service is running
-systemctl is-active moltbot.service
-# Expected: active
-
-# Verify service hardening
-systemctl show moltbot.service | grep -E "NoNewPrivileges|ProtectSystem|PrivateTmp"
-# Expected: All set to yes/strict
-
-# Check logs
-tail -20 /home/moltbot/logs/moltbot-stdout.log
-# Expected: Moltbot startup messages
-
-# Verify process is running as moltbot
-ps aux | grep -E "[n]ode.*moltbot"
-# Expected: Shows process running as moltbot user
-```
-
----
-
-## Phase 13: Final Verification & Testing
-
-### Step 13.1: Complete Security Checklist
-
-Run this comprehensive verification script:
+### Step 9.3: Create Security Check Script
 
 ```bash
 cat > /usr/local/bin/moltbot-security-check << 'EOF'
 #!/bin/bash
-# Moltbot Security Verification Script
 
 echo "=========================================="
-echo "  MOLTBOT SECURITY VERIFICATION"
+echo "  MOLTBOT SECURITY CHECK"
 echo "  $(date)"
 echo "=========================================="
 echo ""
@@ -1674,46 +1041,28 @@ check() {
     fi
 }
 
-echo "--- USER & PERMISSIONS ---"
-check "Moltbot user exists" "id moltbot"
-check "Moltbot has restricted shell" "[[ \$(getent passwd moltbot | cut -d: -f7) == '/bin/rbash' ]]"
-check "Moltbot not in sudo group" "! groups moltbot | grep -q sudo"
-check "Config file permissions (600)" "[[ \$(stat -c %a /home/moltbot/.clawdbot/moltbot.json) == '600' ]]"
-check "Secrets file permissions (640)" "[[ \$(stat -c %a /etc/moltbot/secrets.env) == '640' ]]"
-
-echo ""
 echo "--- FIREWALL ---"
 check "UFW is active" "ufw status | grep -q 'Status: active'"
 check "Default incoming: deny" "ufw status verbose | grep -q 'deny (incoming)'"
 check "SSH only on Tailscale" "ufw status | grep -q 'tailscale0'"
 
 echo ""
-echo "--- APPARMOR ---"
-check "AppArmor is loaded" "aa-status | grep -q 'profiles are loaded'"
-check "Moltbot profile enforced" "aa-status | grep -q 'moltbot'"
+echo "--- DOCKER ---"
+check "Container is running" "docker ps | grep -q moltbot-gateway"
+check "Container is healthy" "docker inspect moltbot-gateway | jq -e '.[0].State.Health.Status == \"healthy\"' 2>/dev/null || docker ps | grep -q 'Up'"
+check "Gateway on localhost only" "ss -tlnp | grep 18789 | grep -q '127.0.0.1'"
 
 echo ""
-echo "--- DOCKER ---"
-check "Docker is running" "systemctl is-active docker"
-check "Moltbot can access Docker" "sudo -u moltbot docker ps"
-check "Sandbox image exists" "docker images | grep -q 'moltbot/sandbox'"
+echo "--- PERSISTENCE ---"
+check "Config directory exists" "[ -d /opt/moltbot/config ]"
+check "Workspace directory exists" "[ -d /opt/moltbot/workspace ]"
+check "Secrets file secure" "[ $(stat -c %a /opt/moltbot/secrets/.env) = '600' ]"
+check "Docker volume exists" "docker volume ls | grep -q moltbot_home"
 
 echo ""
 echo "--- NETWORK ---"
-check "Gateway on localhost only" "ss -tlnp | grep 18789 | grep -q '127.0.0.1'"
-check "Egress filtering active" "iptables -L OUTPUT -n | grep -q 'moltbot'"
-check "Tailscale connected" "tailscale status | grep -q 'offers exit'"
-
-echo ""
-echo "--- AUDIT ---"
-check "Auditd is running" "systemctl is-active auditd"
-check "Moltbot audit rules loaded" "auditctl -l | grep -q moltbot"
-
-echo ""
-echo "--- SERVICE ---"
-check "Moltbot service is active" "systemctl is-active moltbot"
-check "Service has NoNewPrivileges" "systemctl show moltbot | grep -q 'NoNewPrivileges=yes'"
-check "Service has ProtectSystem" "systemctl show moltbot | grep -q 'ProtectSystem=strict'"
+check "Tailscale connected" "tailscale status 2>/dev/null | grep -q -E '(online|offers)'"
+check "IPset configured" "ipset list moltbot_allowed 2>/dev/null | grep -q 'Members'"
 
 echo ""
 echo "=========================================="
@@ -1724,149 +1073,37 @@ exit $FAIL
 EOF
 
 chmod +x /usr/local/bin/moltbot-security-check
-
-# Run the check
-moltbot-security-check
 ```
 
-### Step 13.2: Test Telegram Communication
-
-1. Open Telegram
-2. Find your bot (search for the name you gave it)
-3. Send `/start`
-4. Send a test message: "Hello, what time is it?"
-5. Verify you receive a response
-
-### Step 13.3: Test Security Boundaries
-
-```bash
-# Test 1: Verify moltbot cannot read shadow file
-echo "Test 1: Shadow file access"
-sudo -u moltbot cat /etc/shadow 2>&1 | head -1
-# Expected: Permission denied
-
-# Test 2: Verify moltbot cannot modify system files
-echo "Test 2: System file modification"
-sudo -u moltbot touch /etc/test-file 2>&1
-# Expected: Permission denied
-
-# Test 3: Verify network egress filtering
-echo "Test 3: Blocked network destination"
-sudo -u moltbot curl -s --connect-timeout 5 https://httpbin.org/ip 2>&1 | head -1
-# Expected: Timeout or connection refused
-
-# Test 4: Verify allowed network destination
-echo "Test 4: Allowed network destination"
-sudo -u moltbot curl -s -o /dev/null -w "%{http_code}" https://api.telegram.org/bot123/getMe
-# Expected: 401 or 200 (connection allowed)
-
-# Test 5: Verify sandbox container works
-echo "Test 5: Sandbox container"
-sudo -u moltbot docker run --rm moltbot/sandbox:latest echo "Sandbox OK"
-# Expected: "Sandbox OK"
-```
-
-### Step 13.4: Monitor Initial Operation
-
-```bash
-# Watch logs in real-time
-journalctl -u moltbot.service -f &
-
-# In another terminal, watch audit logs
-tail -f /var/log/audit/audit.log | grep moltbot &
-
-# Send some test messages via Telegram and observe
-```
-
-### Final Verification Checkpoint
-
-```bash
-# Run final security check
-sudo moltbot-security-check
-# Expected: All checks pass
-
-# Verify no unexpected listening ports
-ss -tlnp | grep -v -E "(127.0.0.1|::1|tailscale)"
-# Expected: Only expected services
-
-# Check for any failed services
-systemctl --failed
-# Expected: 0 loaded units listed
-```
-
----
-
-## Appendix: Maintenance & Monitoring
-
-### A.1: Daily Monitoring Commands
-
-```bash
-# Check service health
-systemctl status moltbot.service
-
-# View recent logs
-journalctl -u moltbot.service --since "1 hour ago"
-
-# Check audit summary
-moltbot-audit 24
-
-# Check resource usage
-ps aux | grep moltbot
-docker stats --no-stream
-```
-
-### A.2: Weekly Maintenance Tasks
-
-```bash
-# Update system packages
-apt update && apt upgrade -y
-
-# Update Moltbot
-cd /home/moltbot/moltbot
-git pull
-sudo -u moltbot npm install
-sudo -u moltbot npm run build
-systemctl restart moltbot
-
-# Update Docker image
-docker pull moltbot/sandbox:latest
-
-# Review audit logs
-moltbot-audit 168  # Last week
-
-# Check disk usage
-df -h /home/moltbot
-du -sh /home/moltbot/.clawdbot/*
-```
-
-### A.3: Backup Script
+### Step 9.4: Create Backup Script
 
 ```bash
 cat > /usr/local/bin/moltbot-backup << 'EOF'
 #!/bin/bash
-# Moltbot backup script
+set -e
 
-BACKUP_DIR="/var/backups/moltbot"
+BACKUP_DIR="/opt/moltbot/backups"
 DATE=$(date +%Y%m%d_%H%M%S)
 BACKUP_FILE="$BACKUP_DIR/moltbot_$DATE.tar.gz"
 
-mkdir -p "$BACKUP_DIR"
+echo "Starting Moltbot backup..."
 
-# Stop service briefly for consistent backup
-systemctl stop moltbot.service
-
-# Create backup
+# Create backup (without stopping container for minimal disruption)
 tar -czf "$BACKUP_FILE" \
-    /home/moltbot/.clawdbot \
-    /home/moltbot/workspace \
-    /etc/moltbot/secrets.env \
-    --exclude='*.log'
+    -C /opt/moltbot \
+    config \
+    workspace \
+    --exclude='*.log' \
+    --exclude='node_modules' \
+    2>/dev/null
 
-# Restart service
-systemctl start moltbot.service
+# Also backup the env file separately (encrypted)
+cp /opt/moltbot/secrets/.env "$BACKUP_DIR/secrets_$DATE.env"
+chmod 600 "$BACKUP_DIR/secrets_$DATE.env"
 
 # Remove backups older than 30 days
 find "$BACKUP_DIR" -name "moltbot_*.tar.gz" -mtime +30 -delete
+find "$BACKUP_DIR" -name "secrets_*.env" -mtime +30 -delete
 
 echo "Backup created: $BACKUP_FILE"
 ls -lh "$BACKUP_FILE"
@@ -1874,48 +1111,199 @@ EOF
 
 chmod +x /usr/local/bin/moltbot-backup
 
-# Add to cron (weekly backup)
+# Add to weekly cron
 echo "0 3 * * 0 root /usr/local/bin/moltbot-backup >> /var/log/moltbot-backup.log 2>&1" > /etc/cron.d/moltbot-backup
 ```
 
-### A.4: Emergency Procedures
-
-**If you suspect compromise:**
+### Verification Checkpoint 9
 
 ```bash
-# 1. Immediately stop the service
-systemctl stop moltbot.service
+# Run status check
+moltbot-status
 
-# 2. Block all moltbot network access
-iptables -I OUTPUT -m owner --uid-owner $(id -u moltbot) -j DROP
+# Run security check
+moltbot-security-check
+# Expected: All checks pass
 
-# 3. Capture forensic data
-moltbot-audit 720 > /root/moltbot-audit-dump.txt
-cp -r /home/moltbot/.clawdbot /root/moltbot-forensics/
-docker ps -a > /root/moltbot-docker-state.txt
+# Test backup
+moltbot-backup
+ls -la /opt/moltbot/backups/
+```
 
-# 4. Review recent commands
-ausearch -k moltbot_exec --start today | aureport -x
+---
 
-# 5. Check for persistence mechanisms
-crontab -u moltbot -l
-ls -la /home/moltbot/.bashrc /home/moltbot/.profile
+## Phase 10: Final Verification & Testing
 
-# 6. Consider rebuilding the VPS from scratch
+### Step 10.1: Test Telegram Communication
+
+1. Open Telegram
+2. Find your bot
+3. Send `/start`
+4. Send: "Hello, what time is it?"
+5. Verify response
+
+### Step 10.2: Test Persistence
+
+```bash
+# Create a test file in workspace
+docker exec moltbot-gateway touch /home/node/clawd/persistence-test.txt
+
+# Recreate container
+cd /opt/moltbot
+docker compose down
+docker compose up -d
+
+# Verify file persists
+docker exec moltbot-gateway ls /home/node/clawd/persistence-test.txt
+# Expected: File exists
+
+# Clean up
+docker exec moltbot-gateway rm /home/node/clawd/persistence-test.txt
+```
+
+### Step 10.3: Test Container Rebuild
+
+```bash
+# Simulate complete rebuild
+cd /opt/moltbot
+docker compose down
+docker compose pull  # Get latest image
+docker compose up -d
+
+# Verify everything works
+moltbot-status
+# Send test message via Telegram
+```
+
+### Step 10.4: Run Full Security Check
+
+```bash
+moltbot-security-check
+# Expected: All checks pass
+```
+
+### Final Verification Checklist
+
+```bash
+# Container running
+docker ps | grep moltbot
+
+# Gateway accessible locally
+curl -s http://127.0.0.1:18789/ || echo "Check if health endpoint exists"
+
+# Volumes mounted
+docker inspect moltbot-gateway | jq '.[0].Mounts | length'
+# Expected: 5 mounts
+
+# Firewall configured
+ufw status
+
+# Tailscale connected
+tailscale status
+
+# Send Telegram test message and verify response
+```
+
+---
+
+## Appendix: Maintenance & Persistence
+
+### A.1: Container Management Commands
+
+```bash
+# View logs
+docker compose -f /opt/moltbot/docker-compose.yml logs -f
+
+# Restart container
+docker compose -f /opt/moltbot/docker-compose.yml restart
+
+# Stop container
+docker compose -f /opt/moltbot/docker-compose.yml down
+
+# Start container
+docker compose -f /opt/moltbot/docker-compose.yml up -d
+
+# Update to latest image
+docker compose -f /opt/moltbot/docker-compose.yml pull
+docker compose -f /opt/moltbot/docker-compose.yml up -d
+
+# Shell into container
+docker exec -it moltbot-gateway /bin/bash
+```
+
+### A.2: Persistence Locations
+
+| Data Type | Host Path | Container Path | Purpose |
+|-----------|-----------|----------------|---------|
+| Config/Sessions | `/opt/moltbot/config` | `/home/node/.clawdbot` | Agent data, memory, sessions |
+| Workspace | `/opt/moltbot/workspace` | `/home/node/clawd` | User projects and files |
+| Home Directory | `moltbot_home` volume | `/home/node` | npm cache, shell history |
+| Logs | `/opt/moltbot/logs` | `/home/node/logs` | Application logs |
+| Secrets | `/opt/moltbot/secrets` | N/A (env file) | API keys, tokens |
+
+### A.3: Update Procedure
+
+```bash
+#!/bin/bash
+# /usr/local/bin/moltbot-update
+
+cd /opt/moltbot
+
+echo "Creating backup before update..."
+moltbot-backup
+
+echo "Pulling latest image..."
+docker compose pull
+
+echo "Recreating container..."
+docker compose up -d
+
+echo "Waiting for health check..."
+sleep 30
+
+echo "Verifying..."
+moltbot-status
+moltbot-security-check
+```
+
+### A.4: Disaster Recovery
+
+If you need to restore from backup:
+
+```bash
+# Stop container
+cd /opt/moltbot
+docker compose down
+
+# Restore from backup
+BACKUP_FILE="/opt/moltbot/backups/moltbot_YYYYMMDD_HHMMSS.tar.gz"
+tar -xzf "$BACKUP_FILE" -C /opt/moltbot/
+
+# Restore secrets
+cp /opt/moltbot/backups/secrets_YYYYMMDD_HHMMSS.env /opt/moltbot/secrets/.env
+chmod 600 /opt/moltbot/secrets/.env
+
+# Fix permissions
+chown -R 1000:1000 /opt/moltbot/config
+chown -R 1000:1000 /opt/moltbot/workspace
+
+# Start container
+docker compose up -d
 ```
 
 ### A.5: Useful Aliases
 
-Add to `/root/.bashrc`:
+Add to `/root/.bashrc` and `/home/moltbot-admin/.bashrc`:
 
 ```bash
-# Moltbot management aliases
-alias mb-status='systemctl status moltbot.service'
-alias mb-logs='journalctl -u moltbot.service -f'
-alias mb-restart='systemctl restart moltbot.service'
-alias mb-audit='moltbot-audit'
+# Moltbot management
+alias mb='cd /opt/moltbot && docker compose'
+alias mb-logs='docker compose -f /opt/moltbot/docker-compose.yml logs -f'
+alias mb-status='moltbot-status'
 alias mb-check='moltbot-security-check'
 alias mb-backup='moltbot-backup'
+alias mb-restart='docker compose -f /opt/moltbot/docker-compose.yml restart'
+alias mb-shell='docker exec -it moltbot-gateway /bin/bash'
 ```
 
 ---
@@ -1924,13 +1312,13 @@ alias mb-backup='moltbot-backup'
 
 | Task | Command |
 |------|---------|
-| Check status | `systemctl status moltbot` |
-| View logs | `journalctl -u moltbot -f` |
-| Restart service | `systemctl restart moltbot` |
+| Check status | `moltbot-status` |
+| View logs | `docker compose -f /opt/moltbot/docker-compose.yml logs -f` |
+| Restart | `docker compose -f /opt/moltbot/docker-compose.yml restart` |
 | Security check | `moltbot-security-check` |
-| Audit last 24h | `moltbot-audit 24` |
-| Update IPs | `moltbot-update-ipset` |
+| Update | `docker compose -f /opt/moltbot/docker-compose.yml pull && docker compose up -d` |
 | Backup | `moltbot-backup` |
+| Shell access | `docker exec -it moltbot-gateway /bin/bash` |
 | SSH access | `ssh moltbot-admin@<tailscale-ip>` |
 
 ---
@@ -1939,16 +1327,35 @@ alias mb-backup='moltbot-backup'
 
 | Issue | Solution |
 |-------|----------|
-| Service won't start | Check `journalctl -u moltbot -e` for errors |
-| Telegram not responding | Verify `TELEGRAM_BOT_TOKEN` in secrets.env |
-| API errors | Verify `ANTHROPIC_API_KEY` in secrets.env |
-| Network blocked | Run `moltbot-update-ipset` to refresh IPs |
-| AppArmor denials | Check `dmesg \| grep apparmor` |
-| Docker permission denied | Verify moltbot is in docker group |
-| Audit floods | Adjust rules in `/etc/audit/rules.d/moltbot.rules` |
+| Container won't start | `docker compose logs` to see errors |
+| Telegram not responding | Verify `TELEGRAM_BOT_TOKEN` in `.env` |
+| API errors | Verify `ANTHROPIC_API_KEY` in `.env` |
+| Permission denied | Check ownership: `chown -R 1000:1000 /opt/moltbot/config` |
+| Data lost after restart | Verify volume mounts in `docker-compose.yml` |
+| Can't connect via Tailscale | Check `tailscale status` and firewall |
+| Gateway not accessible | Verify `ss -tlnp | grep 18789` shows 127.0.0.1 |
 
 ---
 
-**Guide Version:** 1.0
+## Key Differences from Bare Metal Install
+
+| Aspect | Bare Metal | Docker (This Guide) |
+|--------|------------|---------------------|
+| Installation | Clone repo, npm install | `docker compose pull` |
+| Updates | git pull, npm install, rebuild | `docker compose pull && up -d` |
+| Isolation | AppArmor, restricted user | Container isolation + resource limits |
+| Persistence | Direct filesystem | Bind mounts + named volumes |
+| Complexity | Higher (many config files) | Lower (single compose file) |
+| Rebuild time | ~10 minutes | ~30 seconds |
+| State survival | Automatic | Requires proper volume mounts |
+
+---
+
+**Guide Version:** 2.0 (Docker Edition)
 **Last Updated:** January 2026
-**Author:** Generated for secure Moltbot deployment
+**Architecture:** Gateway-in-Docker with persistent volumes
+
+**Sources:**
+- [Moltbot Docker Documentation](https://docs.molt.bot/install/docker)
+- [Moltbot Hetzner Guide](https://docs.molt.bot/platforms/hetzner)
+- [GitHub - moltbot/moltbot docker-compose.yml](https://github.com/clawdbot/clawdbot/blob/main/docker-compose.yml)
