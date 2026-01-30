@@ -7,16 +7,17 @@
 1. [Overview](#overview)
 2. [How It Works](#how-it-works)
 3. [Prerequisites](#prerequisites)
-4. [Installation & Setup](#installation--setup)
-5. [Core Concepts](#core-concepts)
-6. [Creating Videos](#creating-videos)
-7. [Creating Still Images](#creating-still-images)
-8. [API Reference](#api-reference)
-9. [Slash Commands](#slash-commands)
-10. [Pricing & Licensing](#pricing--licensing)
-11. [Cost Optimization](#cost-optimization)
-12. [Best Practices](#best-practices)
-13. [Troubleshooting](#troubleshooting)
+4. [Local Rendering Requirements](#local-rendering-requirements)
+5. [Installation & Setup](#installation--setup)
+6. [Core Concepts](#core-concepts)
+7. [Creating Videos](#creating-videos)
+8. [Creating Still Images](#creating-still-images)
+9. [API Reference](#api-reference)
+10. [Slash Commands](#slash-commands)
+11. [Pricing & Licensing](#pricing--licensing)
+12. [Cost Optimization](#cost-optimization)
+13. [Best Practices](#best-practices)
+14. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -66,10 +67,17 @@ Remotion provides a frame number and a blank canvas. Your React components recei
 
 | Requirement | Version | Purpose |
 |------------|---------|---------|
-| Node.js | 20+ | Runtime environment |
+| Node.js | 16+ (18.15+ recommended) | Runtime environment |
 | pnpm/npm/yarn | Latest | Package management |
 | Claude Code | Latest | AI code generation |
-| FFmpeg | Latest | Audio/video processing |
+
+### Auto-Installed (No Manual Setup Needed)
+
+| Dependency | Notes |
+|------------|-------|
+| FFmpeg | Auto-downloads to `node_modules` if not found |
+| FFprobe | Bundled with FFmpeg |
+| Chrome Headless Shell | Auto-downloads if Chrome not detected |
 
 ### Optional (for AI Features)
 
@@ -78,6 +86,210 @@ Remotion provides a frame number and a blank canvas. Your React components recei
 | Replicate API | Image/video generation | Pay-per-use |
 | Deepgram API | Audio transcription | Pay-per-use |
 | ElevenLabs API | AI voiceovers | Pay-per-use |
+
+---
+
+## Local Rendering Requirements
+
+Local rendering runs entirely on your machine with **zero cloud costs**. Remotion automatically handles most dependencies, but here are the complete requirements.
+
+### System Requirements
+
+#### Hardware
+
+| Component | Minimum | Recommended | Notes |
+|-----------|---------|-------------|-------|
+| **RAM** | 1 GB | 2-4 GB | More needed for 4K or complex compositions |
+| **CPU** | 1 core | Multi-core | Remotion uses all available cores (`os.cpus().length`) |
+| **Disk** | 500 MB | 2+ GB | For dependencies + rendered output |
+
+#### Software
+
+| Requirement | Minimum Version | Recommended | Notes |
+|-------------|-----------------|-------------|-------|
+| **Node.js** | 16.0.0 | 18.15.0+ | Required runtime |
+| **Bun** (alternative) | 1.0.3 | Latest | Can be used instead of Node.js |
+| **Libc** (Linux only) | 2.35 | Latest | Required for Linux systems |
+
+### Dependencies (Auto-Installed)
+
+Remotion automatically downloads these dependencies if they're not found on your system:
+
+#### FFmpeg & FFprobe
+
+```bash
+# Remotion downloads automatically, but you can trigger manually:
+npx remotion install ffmpeg
+npx remotion install ffprobe
+```
+
+**Resolution Order:**
+1. Custom path via `ffmpegExecutable` option (if provided)
+2. System PATH (if `ffmpeg` command exists)
+3. Previously installed in `node_modules/.remotion`
+4. Auto-download from internet
+
+**Minimum Version:** 4.1+
+
+#### Chrome Headless Shell
+
+Remotion uses Chrome Headless Shell to render each frame. It will:
+1. Look for an existing Chrome installation on your system
+2. Auto-download Chrome Headless Shell if not found
+
+```bash
+# Check if Chrome is detected
+npx remotion browser detect
+```
+
+### Platform-Specific Requirements
+
+#### macOS
+
+**No additional setup required.** FFmpeg and Chrome are auto-downloaded.
+
+```bash
+# Optional: Install FFmpeg via Homebrew for faster startup
+brew install ffmpeg
+```
+
+#### Windows
+
+**No additional setup required.** FFmpeg and Chrome are auto-downloaded.
+
+```powershell
+# Optional: Install FFmpeg via Chocolatey
+choco install ffmpeg
+```
+
+#### Linux (Debian/Ubuntu)
+
+Chrome requires additional system libraries:
+
+```bash
+# Install Chrome dependencies
+sudo apt-get update
+sudo apt-get install -y \
+  libnss3 \
+  libatk1.0-0 \
+  libatk-bridge2.0-0 \
+  libcups2 \
+  libdrm2 \
+  libxkbcommon0 \
+  libxcomposite1 \
+  libxdamage1 \
+  libxfixes3 \
+  libxrandr2 \
+  libgbm1 \
+  libasound2 \
+  libpango-1.0-0 \
+  libcairo2 \
+  libatspi2.0-0
+```
+
+#### Linux (Arch)
+
+```bash
+sudo pacman -S \
+  dconf alsa-lib atk glibc cairo libcups dbus expat \
+  fontconfig gcc gdk-pixbuf2 glib2 gtk3 nspr pango \
+  gcc-libs libx11 libxcomposite libxcursor libxdamage \
+  libxext libxfixes libxi libxrandr libxrender libxss \
+  libxtst ca-certificates ttf-liberation libappindicator-gtk3 \
+  nss lsb-release xdg-utils wget mesa
+```
+
+#### Linux (Fedora/RHEL)
+
+```bash
+sudo dnf install -y \
+  nss atk at-spi2-atk cups-libs libdrm libxkbcommon \
+  libXcomposite libXdamage libXfixes libXrandr mesa-libgbm \
+  alsa-lib pango cairo
+```
+
+### Unsupported Platforms
+
+| Platform | Status | Reason |
+|----------|--------|--------|
+| Alpine Linux | Not supported | Missing glibc (uses musl) |
+| nixOS | Not supported | Sandboxing conflicts |
+| Linux with Libc < 2.35 | Not supported | Missing required symbols |
+
+### Memory Configuration
+
+Remotion's memory usage scales with video complexity:
+
+| Resolution | Recommended RAM | Concurrency Setting |
+|------------|-----------------|---------------------|
+| 720p | 2 GB | Default |
+| 1080p | 4 GB | Default |
+| 4K | 8+ GB | `--concurrency=2` |
+
+```bash
+# Reduce memory usage for constrained systems
+npx remotion render MyVideo --concurrency=1
+
+# Increase for powerful systems
+npx remotion render MyVideo --concurrency=8
+```
+
+### CPU Utilization
+
+Remotion automatically uses all available CPU cores:
+
+```bash
+# Check available cores
+node -e "console.log(require('os').cpus().length)"
+
+# Limit CPU usage
+npx remotion render MyVideo --concurrency=2
+
+# Use all cores (default)
+npx remotion render MyVideo --concurrency=100%
+```
+
+### Verifying Your Setup
+
+```bash
+# Check all dependencies
+npx remotion --version
+
+# Test browser detection
+npx remotion browser detect
+
+# Test FFmpeg
+npx remotion versions
+
+# Run a test render
+npx remotion render HelloWorld --frames=0-10
+```
+
+### Quick Dependency Install Script
+
+For a fresh Linux server, run this script:
+
+```bash
+#!/bin/bash
+# Install Node.js 18+ (via nvm)
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.0/install.sh | bash
+source ~/.bashrc
+nvm install 18
+nvm use 18
+
+# Install Chrome dependencies (Debian/Ubuntu)
+sudo apt-get update
+sudo apt-get install -y \
+  libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 \
+  libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 \
+  libxrandr2 libgbm1 libasound2 libpango-1.0-0 libcairo2
+
+# Install pnpm
+npm install -g pnpm
+
+# Remotion will auto-download FFmpeg and Chrome on first render
+echo "Setup complete! Run 'npx create-video@latest' to start."
+```
 
 ---
 
